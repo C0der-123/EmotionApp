@@ -44,7 +44,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var interpreter: Interpreter
     private lateinit var cameraPermissionLauncher: ActivityResultLauncher<String>
     private lateinit var cameraExecutor: ExecutorService
-
+    private val currentScreen = mutableStateOf("home") // "home" or "camera"
     private val emotionLabels = listOf("Happy", "Sad", "Surprised", "Fearful", "Angry", "Disgusted", "Neutral")
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -89,22 +89,44 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     fun AppContent(hasPermission: Boolean) {
-        if (hasPermission) {
-            EmotionDetectionWithPreview(
-                interpreter = interpreter,
-                labels = emotionLabels,
-                cameraExecutor = cameraExecutor,
-                modifier = Modifier.fillMaxSize()
-            )
-        } else {
+        if (!hasPermission) {
             Box(
                 modifier = Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center
             ) {
                 Text("Camera permission required")
             }
+            return
+        }
+
+        when (currentScreen.value) {
+            "home" -> HomeScreen()
+            "camera" -> EmotionDetectionWithPreview(
+                interpreter = interpreter,
+                labels = emotionLabels,
+                cameraExecutor = cameraExecutor,
+                modifier = Modifier.fillMaxSize()
+            )
         }
     }
+    @Composable
+    fun HomeScreen() {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("EmotionApp", style = MaterialTheme.typography.headlineLarge)
+                Spacer(modifier = Modifier.height(20.dp))
+                Button(onClick = { currentScreen.value = "camera" }) {
+                    Text("Start Emotion Detection")
+                }
+            }
+        }
+    }
+
 
     private fun loadModelFile(): ByteBuffer {
         val fileDescriptor = assets.openFd("model.tflite")
@@ -133,7 +155,7 @@ fun EmotionDetectionWithPreview(
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val predictionHistory = remember { mutableStateListOf<Int>() }
-    val historySize = 10  // You can adjust this for more/less smoothing
+    val historySize = 5  // You can adjust this for more/less smoothing
     // 1) Remove the “val cameraExecutor = …” here, since you’re receiving it as a parameter.
     //    If you want an executor local to this Composable instead, drop the parameter and
     //    use this block instead:
