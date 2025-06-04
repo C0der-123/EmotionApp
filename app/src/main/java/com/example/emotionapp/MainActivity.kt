@@ -24,21 +24,28 @@ import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.geometry.Size as USize
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.rememberNavController
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
@@ -52,6 +59,7 @@ import java.nio.channels.FileChannel
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.min
+import kotlin.math.max
 sealed class EmotionResult {
     data class Success(val faceRect: Rect, val probs: FloatArray) : EmotionResult()
     data class Error(val message: String) : EmotionResult()
@@ -87,94 +95,8 @@ class MainActivity : ComponentActivity() {
         val emotionTextState = mutableStateOf("Detecting...")
 
         setContent {
-            val inputSize    = remember { mutableStateOf(android.util.Size(480, 480)) }
-            val faceBoxState = remember { mutableStateOf<Rect?>(null) }
-            Box(modifier = Modifier.fillMaxSize()) {
-                val analyzer = remember {
-                    EmotionAnalyzer(interpreter, emotionLabels) { result ->
-                        when (result) {
-                            is EmotionResult.Success -> {
-                                faceBoxState.value = result.faceRect
+            AppNavigation()
 
-                                val probs = result.probs
-                                val maxIdx = probs.indices.maxByOrNull { probs[it] } ?: 0
-                                val prediction = emotionLabels[maxIdx]
-
-                                emotionTextState.value = prediction // ✅ UPDATE HERE
-
-                                Log.d(
-                                    "EmotionApp",
-                                    "Predicted=$prediction  " +
-                                            probs.mapIndexed { i, p -> "${emotionLabels[i]}=${"%.2f".format(p)}" }
-                                                .joinToString(", ")
-                                )
-                            }
-
-                            is EmotionResult.Error -> {
-                                emotionTextState.value = result.message // ✅ show errors on screen too if you want
-                                Log.d("EmotionApp", "Error: ${result.message}")
-                            }
-                        }
-
-                    }
-                }
-
-
-
-                CameraPreviewWithAnalyzer(
-                    cameraExecutor = cameraExecutor,
-                    analyzer = analyzer,
-                    modifier = Modifier.fillMaxSize()
-                )
-
-                // 5) Overlay bounding box on top of the PreviewView
-                BoxWithConstraints {
-                    val parentWidth  = constraints.maxWidth.toFloat()
-                    val parentHeight = constraints.maxHeight.toFloat()
-
-                    faceBoxState.value?.let { box ->
-                        Canvas(modifier = Modifier.fillMaxSize()) {
-                            val inW = inputSize.value.width.toFloat()
-                            val inH = inputSize.value.height.toFloat()
-                            val scale   = if (parentWidth / inW < parentHeight / inH)
-                                (parentWidth / inW)
-                            else
-                                (parentHeight / inH)
-                            val offsetX = (parentWidth  - inW * scale) / 2f
-                            val offsetY = (parentHeight - inH * scale) / 2f
-
-                            val mirroredLeft  = (inW - box.right)
-                            val mirroredRight = (inW - box.left)
-
-                            val left   = offsetX + mirroredLeft  * scale
-                            val top    = offsetY + box.top       * scale
-                            val right  = offsetX + mirroredRight * scale
-                            val bottom = offsetY + box.bottom    * scale
-
-                            drawRect(
-                                color   = Color.Red,
-                                topLeft = Offset(left, top),
-                                size    = androidx.compose.ui.geometry.Size(right - left, bottom - top),
-                                style   = Stroke(width = 4.dp.toPx())
-                            )
-                        }
-                    }
-                }
-
-                // 6) Overlay emotion label at top center
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.TopCenter)
-                        .background(Color.Black.copy(alpha = 0.5f))
-                        .padding(8.dp)
-                ) {
-                    Text(
-                        text = emotionTextState.value,
-                        color = Color.White,
-                        style = MaterialTheme.typography.headlineSmall
-                    )
-                }
-            }
         }
     }
 
@@ -182,6 +104,7 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
         interpreter.close()
     }
+
 
     /**
      * Loads the TFLite model file ("model.tflite") from assets into a ByteBuffer.
@@ -196,7 +119,137 @@ class MainActivity : ComponentActivity() {
             return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
         }
     }
+    @Composable
+    fun AppNavigation() {
+        val navController = rememberNavController()
+        NavHost(navController, startDestination = "home") {
+            composable("home") { HomeScreen { navController.navigate("camera") } }
+            composable("camera") { CameraScreen() }
+        }
+    }
+    @Composable
+    fun HomeScreen(onStartClick: () -> Unit) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(Color(0xFFB3E5FC), Color(0xFF81D4FA)) // light blue gradient
+                    )
+                ),
+            contentAlignment = Alignment.Center
+        ) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Text(
+                    text = "EmotionApp",
+                    fontSize = 36.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.DarkGray
+                )
+                Spacer(modifier = Modifier.height(32.dp))
+                Button(onClick = onStartClick) {
+                    Text(text = "Start Camera")
+                }
+            }
+        }
+    }
+    @Composable
+    fun CameraScreen() {
+        val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
+        val emotionTextState = remember { mutableStateOf("Detecting...") }
+        val faceBoxState = remember { mutableStateOf<Rect?>(null) }
 
+        val analyzer = remember {
+            EmotionAnalyzer(interpreter, emotionLabels) { result ->
+                when (result) {
+                    is EmotionResult.Success -> {
+                        faceBoxState.value = result.faceRect
+                        val probs = result.probs
+                        val maxIdx = probs.indices.maxByOrNull { probs[it] } ?: 0
+                        emotionTextState.value = emotionLabels[maxIdx]
+                    }
+                    is EmotionResult.Error -> {
+                        emotionTextState.value = result.message
+                    }
+                }
+            }
+        }
+
+        Column(modifier = Modifier.fillMaxSize()) {
+            // 1) Emotion text at the top, with padding so it sits below any notch/status bar
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color.Black.copy(alpha = 0.5f))
+                    .padding(top = 48.dp, bottom = 8.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = emotionTextState.value,
+                    color = Color.White,
+                    style = MaterialTheme.typography.headlineSmall
+                )
+            }
+
+            // 2) Camera preview + overlay below the text
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+            ) {
+                CameraPreviewWithAnalyzer(
+                    cameraExecutor = cameraExecutor,
+                    analyzer = analyzer,
+                    modifier = Modifier.fillMaxSize()
+                )
+
+                // Overlay: map 480×480 face‐box into the PreviewView’s letterboxed size
+                BoxWithConstraints {
+                    val parentWidth = constraints.maxWidth.toFloat()
+                    val parentHeight = constraints.maxHeight.toFloat()
+
+                    faceBoxState.value?.let { box ->
+                        Canvas(modifier = Modifier.fillMaxSize()) {
+                            val imageWidth = 480f
+                            val imageHeight = 480f
+                            val scale = min(parentWidth / imageWidth, parentHeight / imageHeight)
+                            val offsetX = (parentWidth - imageWidth * scale) / 2f
+                            val offsetY = (parentHeight - imageHeight * scale) / 2f
+
+                            val padX = (box.width() * 0.2f).toInt()
+                            val padY = (box.height() * 0.2f).toInt()
+
+                            // 2) Make a new Rect that’s expanded by padX/padY (clamp to [0,480])
+                            val expandedLeft   = (box.left   - padX).coerceAtLeast(0)
+                            val expandedTop    = (box.top    - padY).coerceAtLeast(0)
+                            val expandedRight  = (box.right  + padX).coerceAtMost(imageWidth.toInt())
+                            val expandedBottom = (box.bottom + padY).coerceAtMost(imageHeight.toInt())
+                            val paddedBox = Rect(expandedLeft, expandedTop, expandedRight, expandedBottom)
+
+                            // 3) Mirror and scale exactly as before, but use `paddedBox` instead of `box`
+                            val mirroredLeft   = imageWidth - paddedBox.right
+                            val mirroredRight  = imageWidth - paddedBox.left
+
+                            val left   = offsetX + mirroredLeft  * scale
+                            val top    = offsetY + paddedBox.top    * scale
+                            val right  = offsetX + mirroredRight * scale
+                            val bottom = offsetY + paddedBox.bottom * scale
+
+                            drawRect(
+                                color = Color.Red,
+                                topLeft = Offset(left, top),
+                                size = androidx.compose.ui.geometry.Size(right - left, bottom - top),
+                                style = Stroke(width = 4.dp.toPx())
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
     /**
      * Analyzer that:
      * 1) Runs ML Kit face detection on each frame,
@@ -222,7 +275,7 @@ class MainActivity : ComponentActivity() {
 
         // Keep a short history of predictions for a majority vote (smoothing)
         private val predictionHistory = mutableListOf<Int>()
-        private val historySize = 10
+        private val historySize = 5
 
         override fun analyze(imageProxy: ImageProxy) {
             val mediaImage = imageProxy.image
@@ -252,22 +305,30 @@ class MainActivity : ComponentActivity() {
                                 // 4) Run TFLite interpreter
                                 val output = Array(1) { FloatArray(labels.size) }
                                 interpreter.run(inputBuffer, output)
-
+                                val rawProbs = output[0].copyOf()
+                                labels.forEachIndexed { idx, label ->
+                                    Log.d(
+                                        "EmotionApp",
+                                        "Probability → $label: ${"%.3f".format(rawProbs[idx])}"
+                                    )
+                                }
                                 // 5) Find highest‐confidence index
                                 val maxIndex = output[0].indices.maxByOrNull { output[0][it] } ?: -1
                                 if (maxIndex >= 0) {
-                                    // Majority vote smoothing
-                                    predictionHistory.add(maxIndex)
-                                    if (predictionHistory.size > historySize) {
-                                        predictionHistory.removeAt(0)
-                                    }
-                                    val majority = predictionHistory
-                                        .groupingBy { it }
+
+                                    onResult(EmotionResult.Success(boundingBox, predictionHistory
+                                        .also {
+                                            it.add(maxIndex)
+                                            if (it.size > historySize) it.removeAt(0)
+                                        }.groupingBy { it }
                                         .eachCount()
                                         .maxByOrNull { it.value }
-                                        ?.key ?: maxIndex
+                                        ?.key
+                                        ?.let { idx ->
+                                            FloatArray(labels.size) { i -> if (i == idx) 1f else 0f }
+                                        } ?: output[0]
+                                    ))
 
-                                    onResult(EmotionResult.Success(boundingBox, output[0].copyOf()))
                                 } else {
                                     onResult(EmotionResult.Error("Unknown"))
 
@@ -316,18 +377,14 @@ class MainActivity : ComponentActivity() {
         }
 
         // Crop a bitmap to the given face bounding box (with padding)
-        private fun cropToFace(bitmap: Bitmap, boundingBox: Rect): Bitmap {
-            val padX = (boundingBox.width() * 0.3f).toInt()   // 25% padding horizontally
-            val padY = (boundingBox.height() * 0.5f).toInt()  // 40% padding vertically
+        private fun cropToFace(bitmap: Bitmap, rect: Rect): Bitmap {
+            val padding = (rect.width() * 0.2).toInt()  // Add ~20% around
+            val left = max(0, rect.left - padding)
+            val top = max(0, rect.top - padding)
+            val right = min(bitmap.width, rect.right + padding)
+            val bottom = min(bitmap.height, rect.bottom + padding)
 
-            val x = (boundingBox.left - padX).coerceAtLeast(0)
-            val y = (boundingBox.top - padY).coerceAtLeast(0)
-            val right = (boundingBox.right + padX).coerceAtMost(bitmap.width)
-            val bottom = (boundingBox.bottom + padY).coerceAtMost(bitmap.height)
-
-            val width = right - x
-            val height = bottom - y
-            return Bitmap.createBitmap(bitmap, x, y, width, height)
+            return Bitmap.createBitmap(bitmap, left, top, right - left, bottom - top)
         }
 
         // Preprocess the face crop into a ByteBuffer for TFLite (224×224 RGB float)
@@ -374,28 +431,24 @@ class MainActivity : ComponentActivity() {
         val context = LocalContext.current
         val lifecycleOwner = LocalLifecycleOwner.current
 
-        // Shut down executor when this composable is removed
         DisposableEffect(cameraExecutor) {
             onDispose { cameraExecutor.shutdown() }
         }
 
         AndroidView(
             factory = { ctx ->
-                // Create the PreviewView
                 val previewView = PreviewView(ctx).apply {
                     layoutParams = FrameLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.MATCH_PARENT
                     )
-                    scaleType = PreviewView.ScaleType.FILL_CENTER
+                    scaleType = PreviewView.ScaleType.FIT_CENTER
                 }
 
-                // Get CameraProvider
                 val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
                 cameraProviderFuture.addListener({
                     val cameraProvider = cameraProviderFuture.get()
 
-                    // Build Preview use‐case (16:9)
                     val resolutionSelector = ResolutionSelector.Builder()
                         .setAspectRatioStrategy(
                             AspectRatioStrategy(
@@ -411,7 +464,6 @@ class MainActivity : ComponentActivity() {
                             it.setSurfaceProvider(previewView.surfaceProvider)
                         }
 
-                    // Build ImageAnalysis use‐case (480×480)
                     val analysisUseCase = ImageAnalysis.Builder()
                         .setTargetResolution(Size(480, 480))
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
@@ -420,7 +472,6 @@ class MainActivity : ComponentActivity() {
                             it.setAnalyzer(cameraExecutor, analyzer)
                         }
 
-                    // Bind both to the lifecycle (front camera)
                     try {
                         cameraProvider.unbindAll()
                         cameraProvider.bindToLifecycle(
