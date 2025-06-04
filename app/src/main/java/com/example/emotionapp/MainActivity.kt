@@ -1,28 +1,38 @@
 package com.example.emotionapp
 
-import android.Manifest
-import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
+import android.graphics.YuvImage
 import android.os.Bundle
 import android.util.Log
 import android.util.Size
-import android.widget.Toast
 import android.view.ViewGroup
+import android.widget.FrameLayout
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.activity.result.ActivityResultLauncher
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.camera.core.*
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.compose.foundation.Image
+import androidx.camera.view.PreviewView
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
-import androidx.compose.material3.*
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size as USize
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
@@ -30,372 +40,403 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.face.Face
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
 import org.tensorflow.lite.Interpreter
+import java.io.ByteArrayOutputStream
+import java.io.FileInputStream
+import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.channels.FileChannel
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-
+import kotlin.math.min
+sealed class EmotionResult {
+    data class Success(val faceRect: Rect, val probs: FloatArray) : EmotionResult()
+    data class Error(val message: String) : EmotionResult()
+}
 class MainActivity : ComponentActivity() {
 
+    // Interpreter for your TFLite model
     private lateinit var interpreter: Interpreter
-    private lateinit var cameraPermissionLauncher: ActivityResultLauncher<String>
-    private lateinit var cameraExecutor: ExecutorService
-    private val currentScreen = mutableStateOf("home") // "home" or "camera"
-    private val emotionLabels = listOf("Happy", "Sad", "Surprised", "Fearful", "Angry", "Disgusted", "Neutral")
+
+    // Emotion labels must match the output order of your TFLite model
+    private val emotionLabels = listOf(
+        "Happy", "Sad", "Surprised", "Fearful", "Angry", "Disgusted", "Neutral"
+    )
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        interpreter = Interpreter(loadModelFile())
+        // 1) Load your TFLite model from assets
         try {
             interpreter = Interpreter(loadModelFile())
         } catch (e: Exception) {
             Log.e("EmotionApp", "Failed to load model.tflite: ${e.message}", e)
-            Toast.makeText(this, "Failed to load model: ${e.message}", Toast.LENGTH_LONG).show()
             finish()
             return
         }
-        cameraExecutor = Executors.newSingleThreadExecutor()
-        // After `interpreter = Interpreter(loadModelFile())`:
 
-        val inputTensor = interpreter.getInputTensor(0)
-        val shape = inputTensor.shape()
-        val dataType = inputTensor.dataType()
-        Toast.makeText(this, "Model expects input shape: ${shape.joinToString()}, data type: $dataType", Toast.LENGTH_LONG).show()
+        // 2) Create a single‐threaded executor for camera analysis
+        val cameraExecutor = Executors.newSingleThreadExecutor()
 
-        Log.i("EmotionApp", "Model expects shape = ${shape.joinToString()} , dataType = $dataType")
-        // Temporary toast just to be 100% sure this code is executing:
-        cameraPermissionLauncher = registerForActivityResult(
-            ActivityResultContracts.RequestPermission()
-        ) { granted ->
-            setContent { AppContent(granted) }
-        }
-        // Initialize analytics service
-        val hasCameraPermission = ContextCompat.checkSelfPermission(
-            this,
-            Manifest.permission.CAMERA
-        ) == PackageManager.PERMISSION_GRANTED
+        // 3) Create two Compose states: one for face bounding box, one for emotion label
 
-        if (hasCameraPermission) {
-            setContent { AppContent(true) }
-        } else {
-            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
-        }
-    }
 
-    @Composable
-    fun AppContent(hasPermission: Boolean) {
-        if (!hasPermission) {
-            Box(
-                modifier = Modifier.fillMaxSize(),
-                contentAlignment = Alignment.Center
-            ) {
-                Text("Camera permission required")
-            }
-            return
-        }
+        val emotionTextState = mutableStateOf("Detecting...")
 
-        when (currentScreen.value) {
-            "home" -> HomeScreen()
-            "camera" -> EmotionDetectionWithPreview(
-                interpreter = interpreter,
-                labels = emotionLabels,
-                cameraExecutor = cameraExecutor,
-                modifier = Modifier.fillMaxSize()
-            )
-        }
-    }
-    @Composable
-    fun HomeScreen() {
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(16.dp),
-            contentAlignment = Alignment.Center
-        ) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text("EmotionApp", style = MaterialTheme.typography.headlineLarge)
-                Spacer(modifier = Modifier.height(20.dp))
-                Button(onClick = { currentScreen.value = "camera" }) {
-                    Text("Start Emotion Detection")
+        setContent {
+            val inputSize    = remember { mutableStateOf(android.util.Size(480, 480)) }
+            val faceBoxState = remember { mutableStateOf<Rect?>(null) }
+            Box(modifier = Modifier.fillMaxSize()) {
+                val analyzer = remember {
+                    EmotionAnalyzer(interpreter, emotionLabels) { result ->
+                        when (result) {
+                            is EmotionResult.Success -> {
+                                faceBoxState.value = result.faceRect
+
+                                val probs = result.probs
+                                val maxIdx = probs.indices.maxByOrNull { probs[it] } ?: 0
+                                val prediction = emotionLabels[maxIdx]
+
+                                emotionTextState.value = prediction // ✅ UPDATE HERE
+
+                                Log.d(
+                                    "EmotionApp",
+                                    "Predicted=$prediction  " +
+                                            probs.mapIndexed { i, p -> "${emotionLabels[i]}=${"%.2f".format(p)}" }
+                                                .joinToString(", ")
+                                )
+                            }
+
+                            is EmotionResult.Error -> {
+                                emotionTextState.value = result.message // ✅ show errors on screen too if you want
+                                Log.d("EmotionApp", "Error: ${result.message}")
+                            }
+                        }
+
+                    }
+                }
+
+
+
+                CameraPreviewWithAnalyzer(
+                    cameraExecutor = cameraExecutor,
+                    analyzer = analyzer,
+                    modifier = Modifier.fillMaxSize()
+                )
+
+                // 5) Overlay bounding box on top of the PreviewView
+                BoxWithConstraints {
+                    val parentWidth  = constraints.maxWidth.toFloat()
+                    val parentHeight = constraints.maxHeight.toFloat()
+
+                    faceBoxState.value?.let { box ->
+                        Canvas(modifier = Modifier.fillMaxSize()) {
+                            val inW = inputSize.value.width.toFloat()
+                            val inH = inputSize.value.height.toFloat()
+                            val scale   = if (parentWidth / inW < parentHeight / inH)
+                                (parentWidth / inW)
+                            else
+                                (parentHeight / inH)
+                            val offsetX = (parentWidth  - inW * scale) / 2f
+                            val offsetY = (parentHeight - inH * scale) / 2f
+
+                            val mirroredLeft  = (inW - box.right)
+                            val mirroredRight = (inW - box.left)
+
+                            val left   = offsetX + mirroredLeft  * scale
+                            val top    = offsetY + box.top       * scale
+                            val right  = offsetX + mirroredRight * scale
+                            val bottom = offsetY + box.bottom    * scale
+
+                            drawRect(
+                                color   = Color.Red,
+                                topLeft = Offset(left, top),
+                                size    = androidx.compose.ui.geometry.Size(right - left, bottom - top),
+                                style   = Stroke(width = 4.dp.toPx())
+                            )
+                        }
+                    }
+                }
+
+                // 6) Overlay emotion label at top center
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .background(Color.Black.copy(alpha = 0.5f))
+                        .padding(8.dp)
+                ) {
+                    Text(
+                        text = emotionTextState.value,
+                        color = Color.White,
+                        style = MaterialTheme.typography.headlineSmall
+                    )
                 }
             }
         }
     }
 
-
-    private fun loadModelFile(): ByteBuffer {
-        val fileDescriptor = assets.openFd("model.tflite")
-        val inputStream = fileDescriptor.createInputStream()
-        val fileChannel = inputStream.channel
-        val startOffset = fileDescriptor.startOffset
-        val declaredLength = fileDescriptor.declaredLength
-        return fileChannel.map(java.nio.channels.FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
-    }
-
     override fun onDestroy() {
         super.onDestroy()
         interpreter.close()
-        cameraExecutor.shutdown()
-    }
-}
-
-@OptIn(ExperimentalGetImage::class)
-@Composable
-fun EmotionDetectionWithPreview(
-    interpreter: Interpreter,
-    labels: List<String>,
-    cameraExecutor: ExecutorService,         // use the one from MainActivity
-    modifier: Modifier = Modifier
-) {
-    val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
-    val predictionHistory = remember { mutableStateListOf<Int>() }
-    val historySize = 5  // You can adjust this for more/less smoothing
-    // 1) Remove the “val cameraExecutor = …” here, since you’re receiving it as a parameter.
-    //    If you want an executor local to this Composable instead, drop the parameter and
-    //    use this block instead:
-    //
-    // val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
-    // DisposableEffect(cameraExecutor) { onDispose { cameraExecutor.shutdown() } }
-
-    // 2) MLKit face detector: remember + close on disposal
-    val faceDetectorOptions = FaceDetectorOptions.Builder()
-        .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
-        .build()
-    val faceDetector = remember { FaceDetection.getClient(faceDetectorOptions) }
-    DisposableEffect(faceDetector) {
-        onDispose { faceDetector.close() }
     }
 
-    var emotionText by remember { mutableStateOf("Detecting...") }
-    var previewBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
+    /**
+     * Loads the TFLite model file ("model.tflite") from assets into a ByteBuffer.
+     */
+    @Throws(IOException::class)
+    private fun loadModelFile(): ByteBuffer {
+        val fileDescriptor = assets.openFd("model.tflite")
+        FileInputStream(fileDescriptor.fileDescriptor).use { inputStream ->
+            val fileChannel = inputStream.channel
+            val startOffset = fileDescriptor.startOffset
+            val declaredLength = fileDescriptor.declaredLength
+            return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
+        }
+    }
 
-    AndroidView(
-        factory = { ctx ->
-            val previewView = androidx.camera.view.PreviewView(ctx).apply {
-                layoutParams = android.widget.FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT
-                )
+    /**
+     * Analyzer that:
+     * 1) Runs ML Kit face detection on each frame,
+     * 2) Crops + preprocesses the face region,
+     * 3) Runs TFLite inference to get an emotion label,
+     * 4) Passes the face bounding box (image coords) and emotion label back via onResult().
+     */
+    private class EmotionAnalyzer(
+        private val interpreter: Interpreter,
+        private val labels: List<String>,
+        private val onResult: (EmotionResult) -> Unit
+    ) : ImageAnalysis.Analyzer {
+
+
+        // ML Kit face detector (fast mode)
+        private val faceDetector by lazy {
+            FaceDetection.getClient(
+                FaceDetectorOptions.Builder()
+                    .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
+                    .build()
+            )
+        }
+
+        // Keep a short history of predictions for a majority vote (smoothing)
+        private val predictionHistory = mutableListOf<Int>()
+        private val historySize = 10
+
+        override fun analyze(imageProxy: ImageProxy) {
+            val mediaImage = imageProxy.image
+            if (mediaImage == null) {
+                imageProxy.close()
+                return
             }
 
-            cameraProviderFuture.addListener({
-                val cameraProvider = cameraProviderFuture.get()
+            val rotationDegrees = imageProxy.imageInfo.rotationDegrees
+            val inputImage = InputImage.fromMediaImage(mediaImage, rotationDegrees)
 
-                // 3) Analysis at a smaller resolution
-                val analysisUseCase = ImageAnalysis.Builder()
-                    .setTargetResolution(Size(480, 480))
-                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .build()
+            // 1) Run ML Kit face detection
+            faceDetector.process(inputImage)
+                .addOnSuccessListener { faces ->
+                    if (faces.isNotEmpty()) {
+                        val face = faces[0]
+                        val boundingBox = face.boundingBox
 
-                val preview = Preview.Builder()
-                    .setTargetResolution(Size(1280, 720))
-                    .build()
-
-                val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
-
-                preview.setSurfaceProvider(previewView.surfaceProvider)
-
-                analysisUseCase.setAnalyzer(cameraExecutor) { imageProxy ->
-                    val mediaImage = imageProxy.image
-                    if (mediaImage == null) {
-                        imageProxy.close()
-                        return@setAnalyzer
-                    }
-                    val rotationDegrees = imageProxy.imageInfo.rotationDegrees
-                    val inputImage = InputImage.fromMediaImage(mediaImage, rotationDegrees)
-
-                    var closed = false
-                    fun safeClose() {
-                        if (!closed) {
-                            imageProxy.close()
-                            closed = true
-                        }
-                    }
-
-                    faceDetector.process(inputImage)
-                        .addOnSuccessListener { faces ->
-                            if (faces.isNotEmpty()) {
-                                val rawBitmap = imageProxy.toBitmap()
-                                if (rawBitmap == null) {
-                                    Log.e("EmotionApp", "toBitmap() returned null")
-                                    emotionText = "Bitmap error"
-                                    safeClose()
-                                    return@addOnSuccessListener
-                                }
-                                val uprightBitmap = rawBitmap.rotate(rotationDegrees.toFloat())
-
-                                val faceRect = faces[0].boundingBox
-                                val faceCrop = cropToFace(uprightBitmap, faceRect)
-                                if (faceCrop.width == 0 || faceCrop.height == 0) {
-                                    Log.e("EmotionApp", "Cropped face has zero size: $faceRect")
-                                    emotionText = "Crop error"
-                                    safeClose()
-                                    return@addOnSuccessListener
-                                }
-
-                                // ← Use the new RGB preprocess
+                        // 2) Convert ImageProxy → Bitmap and rotate
+                        val rawBitmap = imageProxy.toBitmap()?.rotate(rotationDegrees.toFloat())
+                        if (rawBitmap != null) {
+                            // 3) Crop to face and preprocess for TFLite
+                            val faceCrop = cropToFace(rawBitmap, boundingBox)
+                            if (faceCrop.width > 0 && faceCrop.height > 0) {
                                 val inputBuffer = preprocess(faceCrop)
-                                val expectedBytes = 1 * 224 * 224 * 3 * 4  // = 49152
-                                Log.d("EmotionApp", "ByteBuffer capacity = ${inputBuffer.capacity()} ; expected = $expectedBytes")
+
+                                // 4) Run TFLite interpreter
                                 val output = Array(1) { FloatArray(labels.size) }
                                 interpreter.run(inputBuffer, output)
 
-                                // Log the raw probabilities for all 7 classes:
-                                Log.d(
-                                    "EmotionApp",
-                                    "Raw probs: ${output[0].mapIndexed { idx, prob -> "${labels[idx]}:${"%.3f".format(prob)}" }.joinToString(" | ")}"
-                                )
-
-
+                                // 5) Find highest‐confidence index
                                 val maxIndex = output[0].indices.maxByOrNull { output[0][it] } ?: -1
-                                Log.d("EmotionApp", "Chosen class: $maxIndex -> ${labels[maxIndex]}")
-
                                 if (maxIndex >= 0) {
+                                    // Majority vote smoothing
                                     predictionHistory.add(maxIndex)
                                     if (predictionHistory.size > historySize) {
                                         predictionHistory.removeAt(0)
                                     }
-
                                     val majority = predictionHistory
                                         .groupingBy { it }
                                         .eachCount()
                                         .maxByOrNull { it.value }
                                         ?.key ?: maxIndex
 
-                                    emotionText = labels[majority]
-                                    previewBitmap = faceCrop
+                                    onResult(EmotionResult.Success(boundingBox, output[0].copyOf()))
+                                } else {
+                                    onResult(EmotionResult.Error("Unknown"))
+
                                 }
-
-
                             } else {
-                                emotionText = "No face detected"
-                                previewBitmap = null
+                                onResult(EmotionResult.Error("No face"))
+
                             }
+                        } else {
+                            onResult(EmotionResult.Error("Bitmap conversion failed"))
 
-                            safeClose()
                         }
-                        .addOnFailureListener {
-                            it.printStackTrace()
-                            emotionText = "Face detection failed"
-                            safeClose()
-                        }
+                    } else {
+                        onResult(EmotionResult.Error("No face crop"))
+
+                    }
+                    imageProxy.close()
                 }
+                .addOnFailureListener {
+                    onResult(EmotionResult.Error("Detection failed"))
 
-                try {
-                    cameraProvider.unbindAll()
-                    cameraProvider.bindToLifecycle(
-                        lifecycleOwner,
-                        cameraSelector,
-                        preview,
-                        analysisUseCase
-                    )
-                } catch (exc: Exception) {
-                    Log.e("EmotionDetection", "Use case binding failed", exc)
+                    imageProxy.close()
                 }
-            }, ContextCompat.getMainExecutor(ctx))
-
-            previewView
-        },
-        modifier = modifier
-    )
-
-    Box(modifier = Modifier.fillMaxSize()) {
-        previewBitmap?.let {
-            Image(
-                bitmap = it.asImageBitmap(),
-                contentDescription = "Face Preview",
-                modifier = Modifier.fillMaxSize()
-            )
         }
-        Text(
-            text = emotionText,
-            modifier = Modifier
-                .align(Alignment.TopCenter)
-                .padding(16.dp),
-            style = MaterialTheme.typography.headlineMedium,
-            color = MaterialTheme.colorScheme.primary
+
+        // Extension on ImageProxy to get a Bitmap
+        private fun ImageProxy.toBitmap(): Bitmap? {
+            val yBuffer = planes[0].buffer // Y
+            val uBuffer = planes[1].buffer // U
+            val vBuffer = planes[2].buffer // V
+
+            val ySize = yBuffer.remaining()
+            val uSize = uBuffer.remaining()
+            val vSize = vBuffer.remaining()
+
+            val nv21 = ByteArray(ySize + uSize + vSize)
+            yBuffer.get(nv21, 0, ySize)
+            vBuffer.get(nv21, ySize, vSize)
+            uBuffer.get(nv21, ySize + vSize, uSize)
+
+            val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+            val out = ByteArrayOutputStream()
+            yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 100, out)
+            val imageBytes = out.toByteArray()
+            return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+        }
+
+        // Crop a bitmap to the given face bounding box (with padding)
+        private fun cropToFace(bitmap: Bitmap, boundingBox: Rect): Bitmap {
+            val padX = (boundingBox.width() * 0.3f).toInt()   // 25% padding horizontally
+            val padY = (boundingBox.height() * 0.5f).toInt()  // 40% padding vertically
+
+            val x = (boundingBox.left - padX).coerceAtLeast(0)
+            val y = (boundingBox.top - padY).coerceAtLeast(0)
+            val right = (boundingBox.right + padX).coerceAtMost(bitmap.width)
+            val bottom = (boundingBox.bottom + padY).coerceAtMost(bitmap.height)
+
+            val width = right - x
+            val height = bottom - y
+            return Bitmap.createBitmap(bitmap, x, y, width, height)
+        }
+
+        // Preprocess the face crop into a ByteBuffer for TFLite (224×224 RGB float)
+        private fun preprocess(bitmap: Bitmap): ByteBuffer {
+            val inputSize = 224
+            val scaledBitmap = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
+
+            val byteBuffer = ByteBuffer.allocateDirect(inputSize * inputSize * 3 * 4)
+                .order(ByteOrder.nativeOrder())
+            byteBuffer.rewind()
+
+            for (y in 0 until inputSize) {
+                for (x in 0 until inputSize) {
+                    val pixel = scaledBitmap.getPixel(x, y)
+                    val r = ((pixel shr 16) and 0xFF) / 255f
+                    val g = ((pixel shr 8) and 0xFF) / 255f
+                    val b = (pixel and 0xFF) / 255f
+                    byteBuffer.putFloat(r)
+                    byteBuffer.putFloat(g)
+                    byteBuffer.putFloat(b)
+                }
+            }
+            byteBuffer.rewind()
+            return byteBuffer
+        }
+
+        // Rotate a Bitmap by the given degrees
+        private fun Bitmap.rotate(degrees: Float): Bitmap {
+            val matrix = Matrix().apply { postRotate(degrees) }
+            return Bitmap.createBitmap(this, 0, 0, width, height, matrix, true)
+        }
+    }
+
+    /**
+     * A Composable that binds a PreviewView (camera feed) and an ImageAnalysis use‐case
+     * to the lifecycle. The provided analyzer runs on each camera frame.
+     */
+    @Composable
+    private fun CameraPreviewWithAnalyzer(
+        cameraExecutor: ExecutorService,
+        analyzer: ImageAnalysis.Analyzer,
+        modifier: Modifier = Modifier
+    ) {
+        val context = LocalContext.current
+        val lifecycleOwner = LocalLifecycleOwner.current
+
+        // Shut down executor when this composable is removed
+        DisposableEffect(cameraExecutor) {
+            onDispose { cameraExecutor.shutdown() }
+        }
+
+        AndroidView(
+            factory = { ctx ->
+                // Create the PreviewView
+                val previewView = PreviewView(ctx).apply {
+                    layoutParams = FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                    scaleType = PreviewView.ScaleType.FILL_CENTER
+                }
+
+                // Get CameraProvider
+                val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
+                cameraProviderFuture.addListener({
+                    val cameraProvider = cameraProviderFuture.get()
+
+                    // Build Preview use‐case (16:9)
+                    val resolutionSelector = ResolutionSelector.Builder()
+                        .setAspectRatioStrategy(
+                            AspectRatioStrategy(
+                                androidx.camera.core.AspectRatio.RATIO_16_9,
+                                AspectRatioStrategy.FALLBACK_RULE_AUTO
+                            )
+                        ).build()
+
+                    val previewUseCase = Preview.Builder()
+                        .setResolutionSelector(resolutionSelector)
+                        .build()
+                        .also {
+                            it.setSurfaceProvider(previewView.surfaceProvider)
+                        }
+
+                    // Build ImageAnalysis use‐case (480×480)
+                    val analysisUseCase = ImageAnalysis.Builder()
+                        .setTargetResolution(Size(480, 480))
+                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                        .build()
+                        .also {
+                            it.setAnalyzer(cameraExecutor, analyzer)
+                        }
+
+                    // Bind both to the lifecycle (front camera)
+                    try {
+                        cameraProvider.unbindAll()
+                        cameraProvider.bindToLifecycle(
+                            lifecycleOwner as LifecycleOwner,
+                            CameraSelector.DEFAULT_FRONT_CAMERA,
+                            previewUseCase,
+                            analysisUseCase
+                        )
+                    } catch (exc: Exception) {
+                        Log.e("CameraPreview", "Use case binding failed", exc)
+                    }
+                }, ContextCompat.getMainExecutor(ctx))
+
+                previewView
+            },
+            modifier = modifier
         )
     }
-}
-
-// (Your existing `toBitmap()`, `cropToFace()`, and `preprocess()` functions can stay the same.)
-
-
-
-// Extension function to convert ImageProxy to Bitmap
-fun ImageProxy.toBitmap(): Bitmap? {
-    val yBuffer = planes[0].buffer // Y
-    val uBuffer = planes[1].buffer // U
-    val vBuffer = planes[2].buffer // V
-
-    val ySize = yBuffer.remaining()
-    val uSize = uBuffer.remaining()
-    val vSize = vBuffer.remaining()
-
-    val nv21 = ByteArray(ySize + uSize + vSize)
-
-    yBuffer.get(nv21, 0, ySize)
-    vBuffer.get(nv21, ySize, vSize)
-    uBuffer.get(nv21, ySize + vSize, uSize)
-
-    val yuvImage = android.graphics.YuvImage(nv21, android.graphics.ImageFormat.NV21, width, height, null)
-    val out = java.io.ByteArrayOutputStream()
-    yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 100, out)
-    val imageBytes = out.toByteArray()
-    return android.graphics.BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
-}
-
-// Crop bitmap to face bounding box, clamp to bitmap edges
-fun cropToFace(bitmap: Bitmap, boundingBox: Rect): Bitmap {
-    val padX = (boundingBox.width() * 0.3f).toInt()   // 30% of width
-    val padY = (boundingBox.height() * 0.4f).toInt()  // 40% of height
-
-    val x = (boundingBox.left - padX).coerceAtLeast(0)
-    val y = (boundingBox.top - padY).coerceAtLeast(0)
-    val right = (boundingBox.right + padX).coerceAtMost(bitmap.width)
-    val bottom = (boundingBox.bottom + padY).coerceAtMost(bitmap.height)
-
-    val width = right - x
-    val height = bottom - y
-
-    return Bitmap.createBitmap(bitmap, x, y, width, height)
-}
-
-
-// Preprocess face bitmap into ByteBuffer input for TFLite model
-fun preprocess(bitmap: Bitmap): ByteBuffer {
-    val inputSize = 224
-
-    val scaledBitmap = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
-
-    val byteBuffer = ByteBuffer.allocateDirect(inputSize * inputSize * 3 * 4)
-        .order(ByteOrder.nativeOrder())
-    byteBuffer.rewind()
-
-    for (y in 0 until inputSize) {
-        for (x in 0 until inputSize) {
-            val pixel = scaledBitmap.getPixel(x, y)
-            val r = ((pixel shr 16) and 0xFF) / 255f
-            val g = ((pixel shr 8) and 0xFF) / 255f
-            val b = (pixel and 0xFF) / 255f
-
-            byteBuffer.putFloat(r)
-            byteBuffer.putFloat(g)
-            byteBuffer.putFloat(b)
-        }
-    }
-    byteBuffer.rewind()
-    return byteBuffer
-}
-
-fun Bitmap.rotate(degrees: Float): Bitmap {
-    val matrix = Matrix().apply { postRotate(degrees) }
-    return Bitmap.createBitmap(this, 0, 0, width, height, matrix, true)
 }
